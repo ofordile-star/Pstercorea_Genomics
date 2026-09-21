@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Step 4: Screen bacterial proteomes for short local-similarity hits against
+# a panel of human immune/inflammation proteins (molecular mimicry screen).
+#
+# Requires: ncbi-blast+ (apt-get install -y ncbi-blast+)
+#
+# The human immune panel used in this study (26 genes; see
+# reference_data/immune_panel_26_proteins.faa) was pulled with:
+#
+#   datasets download gene symbol \
+#     TLR1 TLR2 TLR3 TLR4 TLR5 TLR6 TLR7 TLR8 TLR9 TLR10 \
+#     NOD1 NOD2 CD14 LY96 \
+#     IL1B IL6 TNF IL10 CRP \
+#     C3 C5 \
+#     MUC2 REG3A REG3G DEFB1 PIGR \
+#     --taxon human --include protein --filename immune_panel.zip
+#
+# then reduced to one representative RefSeq (NP_) isoform per gene.
+#
+# IMPORTANT CAVEAT (learned the hard way): a raw BLAST hit here is NOT
+# evidence of mimicry by itself. Many hits will be generic shared protein
+# folds (e.g. leucine-rich-repeat domains, common to both TLRs and
+# unrelated bacterial surface proteins) rather than true mimicry. Always
+# follow this step with Pfam/HMMER domain annotation (step 5) to rule out
+# domain-architecture false positives before treating any hit as a real
+# candidate.
+
+set -euo pipefail
+QUERY_PROTEOME="$1"   # concatenated .faa of all predicted proteins
+IMMUNE_PANEL="$2"     # reference_data/immune_panel_26_proteins.faa
+OUT_TSV="$3"
+
+DB="${OUT_TSV%.tsv}_db"
+makeblastdb -in "$IMMUNE_PANEL" -dbtype prot -out "$DB"
+
+blastp -query "$QUERY_PROTEOME" -db "$DB" \
+    -evalue 1e-4 \
+    -outfmt "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen" \
+    -num_threads "$(nproc)" \
+    -out "$OUT_TSV"
+
+echo "Raw hits (E<1e-4): $(wc -l < "$OUT_TSV")"
+
+# Quality filter used in this study: alignment >=25 aa AND >=30% identity.
+# This is a heuristic, not a validated threshold — tune per project.
+awk -F'\t' '$4>=25 && $3>=30' "$OUT_TSV" > "${OUT_TSV%.tsv}_filtered.tsv"
+echo "Quality-filtered candidates: $(wc -l < "${OUT_TSV%.tsv}_filtered.tsv")"
