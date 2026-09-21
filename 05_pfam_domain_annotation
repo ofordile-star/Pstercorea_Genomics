@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Step 5: Pfam/HMMER domain annotation — used two ways in this study:
+#   (a) validate BLAST mimicry candidates against their true domain identity
+#       (caught a DNA-methyltransferase and several generic LRR-repeat
+#       proteins masquerading as immune-mimicry hits)
+#   (b) targeted scan for a specific pathway (LPS/lipid A biosynthesis genes)
+#       by extracting only the relevant Pfam families instead of scanning
+#       the full ~30k-family database every time.
+#
+# Requires: hmmer (apt-get install -y hmmer)
+# Requires: Pfam-A.hmm, downloaded separately (~350MB gzipped) from
+#   https://ftp.ebi.ac.uk/pub/databases/Pfam/current_release/Pfam-A.hmm.gz
+#   (too large to fetch from within a typical sandboxed tool environment —
+#   pull it on a machine with open internet access and transfer it in)
+#
+# PRACTICAL NOTE: hmmscan can abort (SIGABRT) on a predicted-protein FASTA
+# containing an internal '*' stop-codon character (a draft-assembly / gene
+# -calling artifact). Strip trailing stops and replace any *interior* '*'
+# with 'X' before scanning (see the query-cleaning step below), and if
+# scanning a very large proteome (>100k sequences), split it into chunks
+# of ~15-40k sequences per hmmscan call to avoid hitting sandbox resource
+# limits — hmmscan does not need per-genome batching the way BLAST/Prodigal
+# do, but does need protein-count batching.
+
+set -euo pipefail
+CMD="$1"   # "press" | "extract-subset" | "scan"
+
+press_db() {
+    hmmpress "$1"
+}
+
+# Extract a targeted subset of Pfam families by accession, for a fast,
+# small scan instead of the full ~2GB database. Accessions must include
+# version suffix as they appear in the Pfam-A.hmm ACC lines (e.g. PF06293.21) —
+# hmmfetch's SSI index is built on the full versioned accession.
+extract_subset() {
+    local full_db="$1" accession_list="$2" out_hmm="$3"
+    hmmfetch -f "$full_db" "$accession_list" > "$out_hmm"
+    hmmpress "$out_hmm"
+}
+
+# Clean internal stop codons before scanning (see note above).
+clean_query() {
+    python3 - "$1" "$2" <<'PYEOF'
+import sys
+infile, outfile = sys.argv[1], sys.argv[2]
+with open(infile) as f, open(outfile, "w") as out:
+    cur, buf = None, []
+    def flush():
+        if cur is None:
+            return
+        seq = "".join(buf).rstrip("*").replace("*", "X")
+        out.write(f">{cur}\n{seq}\n")
+    for line in f:
+        if line.startswith(">"):
+            flush()
+            cur = line[1:].split()[0]
+            buf = []
+        else:
+            buf.append(line.strip())
+    flush()
+PYEOF
+}
+
+scan() {
+    local hmm_db="$1" query_faa="$2" out_tsv="$3"
+    hmmscan --domtblout "$out_tsv" --cpu 1 -E 1e-5 "$hmm_db" "$query_faa" > /dev/null
+}
+
+case "$CMD" in
+    press) press_db "$2" ;;
+    extract-subset) extract_subset "$2" "$3" "$4" ;;
+    clean) clean_query "$2" "$3" ;;
+    scan) scan "$2" "$3" "$4" ;;
+    *) echo "Usage: $0 {press|extract-subset|clean|scan} ..." >&2; exit 1 ;;
+esac
