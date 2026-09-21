@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Step 2: Predict protein-coding genes for every genome in an accession list.
+#
+# Requires: prodigal (apt-get install -y prodigal)
+#
+# INPUT:  a two-column TSV mapping accession -> path to its .fna file
+#         (NCBI `datasets download genome ... --include genome` unzips to
+#          ncbi_dataset/data/<accession>/<accession>_*_genomic.fna)
+# OUTPUT: one <accession>.faa per genome in $OUTDIR
+#
+# NOTE ON BATCHING: in a sandboxed environment with a wall-clock limit per
+# command, run this in chunks (e.g. 40-70 genomes at a time) and re-run —
+# it skips genomes that already have a completed, non-empty .faa file, so
+# it is safe to re-invoke repeatedly until everything is done:
+#
+#   ./02_gene_calling.sh fna_map.tsv proteins/
+#   ./02_gene_calling.sh fna_map.tsv proteins/   # repeat until "0 remaining"
+
+set -euo pipefail
+FNA_MAP="$1"
+OUTDIR="$2"
+mkdir -p "$OUTDIR"
+
+remaining=0
+while IFS=$'\t' read -r acc fna; do
+    outfile="${OUTDIR}/${acc}.faa"
+    if [ -s "$outfile" ]; then
+        continue
+    fi
+    remaining=$((remaining + 1))
+    prodigal -i "$fna" -a "$outfile" -q > /dev/null 2>"${outfile}.log" || {
+        echo "FAILED: $acc (see ${outfile}.log)"
+        rm -f "$outfile"
+    }
+done < "$FNA_MAP"
+
+echo "Processed this run: $remaining"
+echo "Total complete: $(find "$OUTDIR" -name '*.faa' -size +0 | wc -l)"
