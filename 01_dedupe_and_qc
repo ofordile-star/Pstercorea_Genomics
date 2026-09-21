@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""
+Step 1: Deduplicate NCBI Datasets genome summary JSON and apply QC filter.
+
+WHY THIS STEP EXISTS:
+NCBI Datasets lists the same physical genome assembly twice when it has
+both a GenBank (GCA_) and RefSeq (GCF_) accession. Naively treating each
+accession as an independent genome inflates counts ~2x. This script
+deduplicates by the numeric assembly ID (stripping the GCA_/GCF_ prefix),
+preferring the RefSeq (GCF_) record when both exist.
+
+INPUT:  NCBI Datasets `summary genome taxon "<species>"` JSON output
+        (produced by: datasets summary genome taxon "Prevotella stercorea" > summary.json)
+OUTPUT: qc_pass_accessions.txt — one accession per line, deduplicated,
+        meeting completeness >=90% and contamination <=5% per CheckM
+        info embedded in the NCBI summary.
+
+USAGE:
+    python 01_dedupe_and_qc.py summary.json qc_pass_accessions.txt \
+        --min-completeness 90 --max-contamination 5
+"""
+import argparse
+import json
+
+
+def core_id(accession: str) -> str:
+    """Strip GCA_/GCF_ prefix so paired accessions collapse to one key."""
+    return accession.split("_", 1)[1]
+
+
+def dedupe(reports: list[dict]) -> list[dict]:
+    by_core: dict[str, list[dict]] = {}
+    for r in reports:
+        by_core.setdefault(core_id(r["accession"]), []).append(r)
+
+    deduped = []
+    for _, recs in by_core.items():
+        refseq = [x for x in recs if x["accession"].startswith("GCF_")]
+        deduped.append(refseq[0] if refseq else recs[0])
+    return deduped
+
+
+def qc_pass(reports: list[dict], min_completeness: float, max_contamination: float) -> list[str]:
+    passed = []
+    for r in reports:
+        ci = r.get("checkm_info")
+        if not ci:
+            continue
+        comp = ci.get("completeness")
+        cont = ci.get("contamination")
+        if comp is None or cont is None:
+            continue
+        if comp >= min_completeness and cont <= max_contamination:
+            passed.append(r["accession"])
+    return passed
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("summary_json")
+    ap.add_argument("output_txt")
+    ap.add_argument("--min-completeness", type=float, default=90.0)
+    ap.add_argument("--max-contamination", type=float, default=5.0)
+    args = ap.parse_args()
+
+    data = json.load(open(args.summary_json))
+    reports = data["reports"]
+    print(f"Raw records: {len(reports)}")
+
+    deduped = dedupe(reports)
+    print(f"Unique assemblies after GCA/GCF dedup: {len(deduped)}")
+
+    passed = qc_pass(deduped, args.min_completeness, args.max_contamination)
+    print(f"QC-pass (>={args.min_completeness}% complete, "
+          f"<={args.max_contamination}% contamination): {len(passed)}")
+
+    with open(args.output_txt, "w") as f:
+        f.write("\n".join(passed))
+
+
+if __name__ == "__main__":
+    main()
