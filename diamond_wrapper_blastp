@@ -1,0 +1,20 @@
+#!/bin/bash
+# Wrapper: translate Roary's blastp call into a diamond blastp call.
+# Roary's own command string appends ` | awk ... 1> outfile` AFTER this
+# executable's arguments, so this script just needs to write outfmt-6
+# tabular output to stdout, same as real blastp would.
+QUERY=""; DB=""; EVALUE="1e-6"; THREADS="1"; MAXTARGET="1000"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -query) QUERY="$2"; shift 2;;
+    -db) DB="$2"; shift 2;;
+    -evalue) EVALUE="$2"; shift 2;;
+    -num_threads) THREADS="$2"; shift 2;;
+    -outfmt) shift 2;;
+    -max_target_seqs) MAXTARGET="$2"; shift 2;;
+    *) shift;;
+  esac
+done
+diamond blastp --query "$QUERY" --db "${DB}.dmnd" --evalue "$EVALUE" \
+  --threads "$THREADS" --max-target-seqs "$MAXTARGET" --outfmt 6 --quiet \
+ 
