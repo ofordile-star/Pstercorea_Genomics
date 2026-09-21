@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""
+Step 7: Concatenated single-copy marker-gene maximum-likelihood phylogeny.
+
+Replaces/supplements the ANI dendrogram (script 03) with a proper phylogenetic
+tree, built from 19 universal single-copy bacterial ribosomal protein Pfam
+families rather than a full core-genome/pangenome alignment (which would
+require Panaroo or similar and GFF3-annotated genomes we no longer had on
+disk when this was built — this marker-gene approach uses only the predicted
+protein FASTA files already produced by script 02, and is standard practice
+for large multi-genome phylogenies, e.g. PhyloSift/CheckM/GTDB-Tk-style
+marker sets).
+
+Requires: hmmer, mafft, fasttree (all apt-installable), biopython (pip)
+
+Pipeline:
+  1. Extract 19 ribosomal-protein Pfam HMMs from the full Pfam-A database
+  2. hmmscan every genome's proteome against this small marker set
+  3. Keep genomes with >=14/19 markers detected (drops fragmented drafts)
+  4. Align each marker independently across all genomes with MAFFT;
+     genomes missing a given marker get a gap-filled block of matching length
+  5. Concatenate into a supermatrix
+  6. FastTree2 (LG+GAMMA) for the ML tree with local support values
+
+USAGE (run from the directory containing your Pfam-A.hmm and per-genome
+protein FASTA files, e.g. proteins/<accession>.faa):
+
+    # 1. Extract marker HMMs (accessions in reference_data/ribosomal_marker_pfam_accessions_19.txt)
+    hmmfetch -f Pfam-A.hmm ribosomal_marker_pfam_accessions_19.txt > marker_genes.hmm
+    hmmpress marker_genes.hmm
+
+    # 2. Scan concatenated proteome
+    cat proteins/*.faa > all_proteins.faa
+    hmmscan --domtblout marker_hits.tsv --cpu 1 -E 1e-10 marker_genes.hmm all_proteins.faa
+
+    # 3-6. Run this script
+    python 07_core_genome_phylogeny.py marker_hits.tsv proteins/ --min-markers 14
+"""
+import argparse
+import glob
+import os
+import subprocess
+from collections import defaultdict
+
+MARKER_NAMES = [
+    "Ribosomal_L3", "Ribosomal_L4", "Ribosomal_L5", "Ribosomal_L6", "Ribosomal_L14",
+    "Ribosomal_L16", "Ribosomal_L18p", "Ribosomal_L22", "ribosomal_L24",
+    "Ribosomal_S2", "Ribosomal_S3_C", "Ribosomal_S7", "Ribosomal_S8", "Ribosomal_S9",
+    "Ribosomal_S10", "Ribosomal_S11", "Ribosomal_S13", "Ribosomal_S17", "Ribosomal_S19",
+]
+
+
+def parse_domtblout(path):
+    rows = []
+    with open(path) as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            p = line.split()
+            rows.append({"family": p[0], "query": p[3], "evalue": float(p[6])})
+    return rows
+
+
+def build_contig_to_accession(protein_dir):
+    """Map contig prefix -> genome accession by scanning per-genome protein files.
+    (Avoids needing the raw genome FASTA, which you may no longer have on disk.)"""
+    mapping = {}
+    for fname in glob.glob(os.path.join(protein_dir, "*.faa")):
+        acc = os.path.basename(fname)[:-4]
+        with open(fname) as fh:
+            for line in fh:
+                if line.startswith(">"):
+                    qid = line[1:].split()[0]
+                    contig = qid.rsplit("_", 1)[0]
+                    mapping[contig] = acc
+    return mapping
+
+
+def best_hits_per_genome(rows, contig_to_acc):
+    best = {}
+    for r in rows:
+        contig = r["query"].rsplit("_", 1)[0]
+        acc = contig_to_acc.get(contig)
+        if acc is None:
+            continue
+        key = (acc, r["family"])
+        if key not in best or r["evalue"] < best[key]["evalue"]:
+            best[key] = r
+    return best
+
+
+def load_protein(protein_dir, acc, qid):
+    seqs = {}
+    cur, buf = None, []
+    with open(os.path.join(protein_dir, f"{acc}.faa")) as f:
+        for line in f:
+            if line.startswith(">"):
+                if cur:
+                    seqs[cur] = "".join(buf)
+                cur = line[1:].split()[0]
+                buf = []
+            else:
+                buf.append(line.strip())
+        if cur:
+            seqs[cur] = "".join(buf)
+    return seqs.get(qid)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("marker_hits_tsv")
+    ap.add_argument("protein_dir")
+    ap.add_argument("--min-markers", type=int, default=14)
+    ap.add_argument("--out-prefix", default="core_genome")
+    args = ap.parse_args()
+
+    contig_to_acc = build_contig_to_accession(args.protein_dir)
+    rows = parse_domtblout(args.marker_hits_tsv)
+    best = best_hits_per_genome(rows, contig_to_acc)
+
+    per_genome = defaultdict(set)
+    for (acc, fam) in best:
+        per_genome[acc].add(fam)
+
+    included = sorted(acc for acc, fams in per_genome.items() if len(fams) >= args.min_markers)
+    print(f"Genomes with >={args.min_markers}/{len(MARKER_NAMES)} markers: {len(included)}")
+
+    os.makedirs("marker_seqs", exist_ok=True)
+    for fam in MARKER_NAMES:
+        out_path = f"marker_seqs/{fam}.faa"
+        with open(out_path, "w") as out:
+            for acc in included:
+                key = (acc, fam)
+                if key in best:
+                    seq = load_protein(args.protein_dir, acc, best[key]["query"])
+                    if seq:
+                        out.write(f">{acc}\n{seq}\n")
+        # Align with MAFFT
+        subprocess.run(
+            f"mafft --auto --quiet {out_path} > marker_seqs/{fam}.aln.fasta",
+            shell=True, check=True,
+        )
+
+    # Concatenate alignments, gap-filling genomes missing a given marker
+    concat = {acc: [] for acc in included}
+    total_len = 0
+    for fam in MARKER_NAMES:
+        seqs = {}
+        cur, buf = None, []
+        with open(f"marker_seqs/{fam}.aln.fasta") as f:
+            for line in f:
+                if line.startswith(">"):
+                    if cur:
+                        seqs[cur] = "".join(buf)
+                    cur = line[1:].strip()
+                    buf = []
+                else:
+                    buf.append(line.strip())
+            if cur:
+                seqs[cur] = "".join(buf)
+        aln_len = len(next(iter(seqs.values())))
+        total_len += aln_len
+        for acc in included:
+            concat[acc].append(seqs.get(acc, "-" * aln_len))
+
+    supermatrix_path = f"{args.out_prefix}_supermatrix.fasta"
+    with open(supermatrix_path, "w") as out:
+        for acc in included:
+            out.write(f">{acc}\n{''.join(concat[acc])}\n")
+    print(f"Supermatrix: {len(included)} genomes x {total_len} positions -> {supermatrix_path}")
+
+    tree_path = f"{args.out_prefix}_tree.nwk"
+    subprocess.run(
+        f"fasttree -lg -gamma {supermatrix_path} > {tree_path}",
+        shell=True, check=True,
+    )
+    print(f"Tree written: {tree_path}")
+    print("Render with Bio.Phylo, ete3, iTOL, or FigTree; root at midpoint for display.")
+
+
+if __name__ == "__main__":
+    main()
