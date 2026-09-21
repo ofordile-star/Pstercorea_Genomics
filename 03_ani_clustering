@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""
+Step 3: All-vs-all ANI + hierarchical clustering to detect population
+structure within a species' genome set.
+
+Requires: pyskani (pip install pyskani), pandas, numpy, scipy
+
+INPUT:  a two-column TSV mapping accession -> path to its .fna file
+OUTPUT:
+    ani_pairs.tsv     — raw directed pairwise ANI hits from skani
+    ani_matrix.npy    — symmetric N x N percent-identity matrix (numpy)
+    ani_accs.txt      — row/column order for ani_matrix.npy
+    clusters_dedup.tsv — cluster assignment per genome at a chosen ANI cutoff
+
+NOTE: pyskani's `identity` field is a FRACTION (0-1), not a percentage —
+multiply by 100 before interpreting. This tripped us up once; don't repeat
+that mistake.
+
+USAGE:
+    python 03_ani_clustering.py fna_map.tsv --cutoff-ani 97 --out-prefix ani
+"""
+import argparse
+import csv
+import time
+
+import numpy as np
+import pandas as pd
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial.distance import squareform
+
+
+def read_contigs(path: str) -> list[str]:
+    contigs, seq = [], []
+    with open(path) as f:
+        for line in f:
+            if line.startswith(">"):
+                if seq:
+                    contigs.append("".join(seq))
+                    seq = []
+            else:
+                seq.append(line.strip())
+        if seq:
+            contigs.append("".join(seq))
+    return contigs
+
+
+def sketch_and_query(fna_map: dict[str, str], out_prefix: str) -> str:
+    import pyskani
+
+    db = pyskani.Database()
+    t0 = time.time()
+    for acc, path in fna_map.items():
+        db.sketch(acc, *read_contigs(path))
+    print(f"Sketched {len(fna_map)} genomes in {time.time()-t0:.1f}s")
+
+    pairs_path = f"{out_prefix}_pairs.tsv"
+    with open(pairs_path, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        w.writerow(["query", "ref", "identity", "query_frac", "ref_frac"])
+        for acc, path in fna_map.items():
+            for hit in db.query(acc, *read_contigs(path)):
+                if hit.reference_name != acc:
+                    w.writerow([acc, hit.reference_name, hit.identity,
+                                hit.query_fraction, hit.reference_fraction])
+    return pairs_path
+
+
+def build_matrix(pairs_path: str, floor_ani: float = 75.0):
+    df = pd.read_csv(pairs_path, sep="\t")
+    df["identity"] *= 100.0  # fraction -> percent; see module docstring
+    accs = sorted(set(df["query"]) | set(df["ref"]))
+    idx = {a: i for i, a in enumerate(accs)}
+    n = len(accs)
+
+    raw = np.full((n, n), np.nan)
+    for _, row in df.iterrows():
+        raw[idx[row["query"]], idx[row["ref"]]] = row["identity"]
+
+    sym = np.full((n, n), np.nan)
+    for i in range(n):
+        sym[i, i] = 100.0
+        for j in range(i + 1, n):
+            vals = [v for v in (raw[i, j], raw[j, i]) if not np.isnan(v)]
+            if vals:
+                sym[i, j] = sym[j, i] = sum(vals) / len(vals)
+
+    # Pairs below skani's default 80% cutoff never appear in the output;
+    # floor them rather than leaving NaN, since we know they're <80%.
+    filled = np.where(np.isnan(sym), floor_ani, sym)
+    return accs, filled
+
+
+def cluster(accs, matrix, ani_cutoff: float):
+    dist = 100.0 - matrix
+    np.fill_diagonal(dist, 0)
+    dist = (dist + dist.T) / 2
+    Z = linkage(squareform(dist, checks=False), method="average")
+    labels = fcluster(Z, t=100 - ani_cutoff, criterion="distance")
+    return pd.DataFrame({"accession": accs, "cluster": labels})
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("fna_map_tsv")
+    ap.add_argument("--out-prefix", default="ani")
+    ap.add_argument("--cutoff-ani", type=float, default=97.0,
+                     help="ANI threshold (percent) defining a cluster")
+    args = ap.parse_args()
+
+    fna_map = dict(line.strip().split("\t") for line in open(args.fna_map_tsv))
+    pairs_path = sketch_and_query(fna_map, args.out_prefix)
+    accs, matrix = build_matrix(pairs_path)
+    np.save(f"{args.out_prefix}_matrix.npy", matrix)
+    with open(f"{args.out_prefix}_accs.txt", "w") as f:
+        f.write("\n".join(accs))
+
+    clusters = cluster(accs, matrix, args.cutoff_ani)
+    clusters.to_csv(f"{args.out_prefix}_clusters.tsv", sep="\t", index=False)
+    print(f"{clusters['cluster'].nunique()} clusters at {args.cutoff_ani}% ANI")
+
+
+if __name__ == "__main__":
+    main()
