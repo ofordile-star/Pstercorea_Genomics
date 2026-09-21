@@ -1,0 +1,13 @@
+#!/bin/bash
+# Wrapper: translate Roary's makeblastdb call into a diamond makedb call
+IN=""; OUT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -in) IN="$2"; shift 2;;
+    -dbtype) shift 2;;
+    -out) OUT="$2"; shift 2;;
+    -logfile) shift 2;;
+    *) shift;;
+  esac
+done
+diamond makedb --in "$IN" --db "$OUT" --quiet
