@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""
+Step 6: Compare LPS/lipid-A biosynthesis and modification gene-family
+presence between two species' genome sets, with a formal statistical test.
+
+This is the script that produced the headline finding of this study:
+Lipid_A_deac (PGN_1123-type lipid A 3'-O-deacylase) present in 85/86
+P. stercorea genomes and 0/258 S. copri genomes (Fisher's exact
+p = 5.1e-81).
+
+INPUT:  two hmmscan --domtblout files (one per species), produced by
+        05_pfam_domain_annotation.sh against the LPS-pathway Pfam subset
+OUTPUT: per-family presence counts, rate per genome, and a Fisher's exact
+        test for any family you specify.
+
+USAGE:
+    python 06_lps_pathway_comparison.py \
+        species_a_domains.tsv species_a_n_genomes \
+        species_b_domains.tsv species_b_n_genomes \
+        --test-family Lipid_A_deac
+"""
+import argparse
+from collections import Counter
+
+from scipy.stats import fisher_exact
+
+
+def parse_domtblout(path: str) -> list[dict]:
+    rows = []
+    with open(path) as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            p = line.split()
+            rows.append({
+                "target": p[0], "query": p[3],
+                "qlen": int(p[5]), "tlen": int(p[2]),
+                "evalue": float(p[6]),
+                "hmm_from": int(p[15]), "hmm_to": int(p[16]),
+            })
+    return rows
+
+
+def best_hit_per_query(rows: list[dict]) -> dict[str, dict]:
+    """Collapse multi-domain hits on the same protein to its best hit,
+    so a single large multi-domain protein isn't counted multiple times."""
+    best: dict[str, dict] = {}
+    for r in rows:
+        q = r["query"]
+        if q not in best or r["evalue"] < best[q]["evalue"]:
+            best[q] = r
+    return best
+
+
+def family_counts(rows: list[dict]) -> Counter:
+    return Counter(r["target"] for r in best_hit_per_query(rows).values())
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("species_a_domtbl")
+    ap.add_argument("species_a_n", type=int)
+    ap.add_argument("species_b_domtbl")
+    ap.add_argument("species_b_n", type=int)
+    ap.add_argument("--label-a", default="species_a")
+    ap.add_argument("--label-b", default="species_b")
+    ap.add_argument("--test-family", action="append", default=[],
+                     help="Run Fisher's exact test for this Pfam family "
+                          "(repeatable)")
+    args = ap.parse_args()
+
+    a_rows = parse_domtblout(args.species_a_domtbl)
+    b_rows = parse_domtblout(args.species_b_domtbl)
+    a_counts = family_counts(a_rows)
+    b_counts = family_counts(b_rows)
+
+    all_families = sorted(set(a_counts) | set(b_counts))
+    print(f"{'Family':<20} {args.label_a+' (n='+str(args.species_a_n)+')':>22} "
+          f"{args.label_b+' (n='+str(args.species_b_n)+')':>22} "
+          f"{'per-genome A':>14} {'per-genome B':>14}")
+    for fam in all_families:
+        na, nb = a_counts.get(fam, 0), b_counts.get(fam, 0)
+        print(f"{fam:<20} {na:>22} {nb:>22} "
+              f"{na/args.species_a_n:>14.3f} {nb/args.species_b_n:>14.3f}")
+
+    for fam in args.test_family:
+        na = a_counts.get(fam, 0)
+        nb = b_counts.get(fam, 0)
+        table = [[na, args.species_a_n - na], [nb, args.species_b_n - nb]]
+        odds, p = fisher_exact(table)
+        print(f"\nFisher's exact test — {fam}:")
+        print(f"  {args.label_a}: {na}/{args.species_a_n}   "
+              f"{args.label_b}: {nb}/{args.species_b_n}")
+        print(f"  odds ratio = {odds:.3e}   p = {p:.3e}")
+
+
+if __name__ == "__main__":
+    main()
